@@ -14,8 +14,6 @@ import (
 	"paperqual/internal/evidence"
 )
 
-const maxOpenEventFiles = 32
-
 func (r *Repository) writeSnapshot(batchID string, snap Snapshot) error {
 	raw, err := evidence.CanonicalJSON(snap)
 	if err != nil {
@@ -69,37 +67,19 @@ func (r *Repository) appendFrame(batchID string, frame EventFrame) error {
 	record = append(record, header...)
 	record = append(record, raw...)
 	record = append(record, '\n')
-	r.eventFilesMu.Lock()
-	defer r.eventFilesMu.Unlock()
-	f, err := r.eventAppendFile(batchID)
+	// Always open the current file at the canonical path so that an externally
+	// rotated/rebuilt log (renamed away and re-created with the same name) is
+	// honoured: a stale cached handle would write into the orphaned backup and
+	// leave the live log behind the snapshot, breaking the event-chain anchor.
+	f, err := os.OpenFile(r.eventPath(batchID), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
 	if err != nil {
 		return err
 	}
+	defer f.Close()
 	if _, err := f.Write(record); err != nil {
 		return err
 	}
 	return f.Sync()
-}
-
-func (r *Repository) eventAppendFile(batchID string) (*os.File, error) {
-	if f := r.eventFiles[batchID]; f != nil {
-		return f, nil
-	}
-	if len(r.eventFiles) >= maxOpenEventFiles {
-		for cachedBatchID, cached := range r.eventFiles {
-			if err := cached.Close(); err != nil {
-				return nil, err
-			}
-			delete(r.eventFiles, cachedBatchID)
-			break
-		}
-	}
-	f, err := os.OpenFile(r.eventPath(batchID), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
-	if err != nil {
-		return nil, err
-	}
-	r.eventFiles[batchID] = f
-	return f, nil
 }
 
 func (r *Repository) readTimeline(batchID string, recoverTail bool) ([]TimelineEntry, string, error) {

@@ -17,10 +17,8 @@ import (
 var safeID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
 type Repository struct {
-	root         string
-	locks        [128]sync.RWMutex
-	eventFilesMu sync.Mutex
-	eventFiles   map[string]*os.File
+	root  string
+	locks [128]sync.RWMutex
 }
 
 func Open(root string) (*Repository, error) {
@@ -32,7 +30,7 @@ func Open(root string) (*Repository, error) {
 			return nil, err
 		}
 	}
-	r := &Repository{root: root, eventFiles: map[string]*os.File{}}
+	r := &Repository{root: root}
 	batchIDs := map[string]bool{}
 	locations := []struct {
 		directory string
