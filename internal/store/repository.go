@@ -138,7 +138,97 @@ func (r *Repository) loadUnlocked(batchID string) (Snapshot, error) {
 	if uint64(len(entries)) != snap.Sequence || anchor != snap.EventAnchor {
 		return Snapshot{}, domain.Errorf(domain.CodeEvidenceCorrupt, "快照锚点与事件链不一致")
 	}
-	return snap, nil
+	return cloneSnapshot(snap), nil
+}
+
+// cloneSnapshot returns a deep copy of snap so callers cannot mutate cached
+// nested mutable data (slices, maps, pointers) through the returned value.
+func cloneSnapshot(snap Snapshot) Snapshot {
+	out := snap
+	out.Batch = cloneBatch(snap.Batch)
+	out.Idempotency = cloneIdempotency(snap.Idempotency)
+	out.Certificate = append(json.RawMessage(nil), snap.Certificate...)
+	return out
+}
+
+func cloneBatch(b domain.TreatmentBatch) domain.TreatmentBatch {
+	out := b
+	out.Items = cloneItems(b.Items)
+	out.Rounds = cloneRounds(b.Rounds)
+	out.Corrections = cloneCorrections(b.Corrections)
+	if b.Review != nil {
+		out.Review = cloneReview(b.Review)
+	}
+	return out
+}
+
+func cloneItems(items []domain.ArchiveItem) []domain.ArchiveItem {
+	if items == nil {
+		return nil
+	}
+	out := make([]domain.ArchiveItem, len(items))
+	for i := range items {
+		out[i] = items[i]
+		out[i].FailureCodes = append([]string(nil), items[i].FailureCodes...)
+	}
+	return out
+}
+
+func cloneRounds(rounds []domain.TreatmentRound) []domain.TreatmentRound {
+	if rounds == nil {
+		return nil
+	}
+	out := make([]domain.TreatmentRound, len(rounds))
+	for i := range rounds {
+		out[i] = rounds[i]
+		if rounds[i].Measurements != nil {
+			out[i].Measurements = make([]domain.Measurement, len(rounds[i].Measurements))
+			for j := range rounds[i].Measurements {
+				out[i].Measurements[j] = rounds[i].Measurements[j]
+				out[i].Measurements[j].FailureCodes = append([]string(nil), rounds[i].Measurements[j].FailureCodes...)
+			}
+		}
+	}
+	return out
+}
+
+func cloneCorrections(corrections []domain.Correction) []domain.Correction {
+	if corrections == nil {
+		return nil
+	}
+	out := make([]domain.Correction, len(corrections))
+	for i := range corrections {
+		out[i] = corrections[i]
+		out[i].FailureCodes = append([]string(nil), corrections[i].FailureCodes...)
+		if corrections[i].Cause != nil {
+			cause := *corrections[i].Cause
+			out[i].Cause = &cause
+		}
+	}
+	return out
+}
+
+func cloneReview(review *domain.QualityReview) *domain.QualityReview {
+	if review == nil {
+		return nil
+	}
+	out := *review
+	out.SampledItemIDs = append([]string(nil), review.SampledItemIDs...)
+	out.ItemDecisions = append([]domain.ReviewItemDecision(nil), review.ItemDecisions...)
+	out.RejectionReasons = append([]string(nil), review.RejectionReasons...)
+	return &out
+}
+
+func cloneIdempotency(m map[string]IdempotencyEntry) map[string]IdempotencyEntry {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]IdempotencyEntry, len(m))
+	for k, v := range m {
+		v.Response = append(json.RawMessage(nil), v.Response...)
+		out[k] = v
+	}
+	return out
 }
 
 func (r *Repository) cached(batchID, digest string) (Snapshot, bool) {
@@ -155,6 +245,12 @@ func (r *Repository) remember(batchID, digest string, snap Snapshot) {
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
 	r.cache[batchID] = cachedSnapshot{digest: digest, snapshot: snap}
+}
+
+func (r *Repository) forget(batchID string) {
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	delete(r.cache, batchID)
 }
 
 func (r *Repository) Lookup(batchID, requestID, fingerprint string) (IdempotencyEntry, bool, error) {
@@ -241,6 +337,7 @@ func (r *Repository) commitUnlocked(snap Snapshot, req CommitRequest, create boo
 		snap.Certificate = append(json.RawMessage(nil), req.Certificate...)
 	}
 	if err := r.writeSnapshot(req.Batch.BatchID, snap); err != nil {
+		r.forget(req.Batch.BatchID)
 		rollbackErr := r.truncateEventsAfter(req.Batch.BatchID, frame.Sequence-1)
 		if rollbackErr != nil {
 			return Snapshot{}, fmt.Errorf("写入快照失败且事件回退失败: %v; %w", rollbackErr, err)
@@ -248,7 +345,7 @@ func (r *Repository) commitUnlocked(snap Snapshot, req CommitRequest, create boo
 		return Snapshot{}, err
 	}
 	raw, _ := evidence.CanonicalJSON(snap)
-	r.remember(req.Batch.BatchID, domain.Digest(raw), snap)
+	r.remember(req.Batch.BatchID, domain.Digest(raw), cloneSnapshot(snap))
 	return snap, nil
 }
 
