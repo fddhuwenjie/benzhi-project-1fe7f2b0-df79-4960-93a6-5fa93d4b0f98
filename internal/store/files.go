@@ -16,15 +16,23 @@ import (
 
 type timelineReadFailure struct {
 	batchID string
-	message string
+	cause   error
 }
 
 func (e *timelineReadFailure) Error() string {
-	return fmt.Sprintf("读取批次 %s 事件链失败: %s", e.batchID, e.message)
+	if e.cause != nil {
+		return fmt.Sprintf("读取批次 %s 事件链失败: %s", e.batchID, e.cause)
+	}
+	return fmt.Sprintf("读取批次 %s 事件链失败", e.batchID)
 }
 
+// Unwrap preserves the underlying error chain so callers can identify the
+// original storage-layer cause (for example syscall.ENOTDIR when the events
+// parent path has been replaced by a regular file) via errors.Is/errors.As.
+func (e *timelineReadFailure) Unwrap() error { return e.cause }
+
 func newTimelineReadFailure(batchID string, err error) error {
-	return &timelineReadFailure{batchID: batchID, message: err.Error()}
+	return &timelineReadFailure{batchID: batchID, cause: err}
 }
 
 func (r *Repository) writeSnapshot(batchID string, snap Snapshot) error {
