@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"paperqual/internal/domain"
@@ -32,6 +33,7 @@ type preflightCacheKey struct {
 }
 
 type preflightCache struct {
+	mu      sync.RWMutex
 	entries []preflightCacheEntry
 	next    int
 }
@@ -41,6 +43,8 @@ func newPreflightCache(limit int) *preflightCache {
 }
 
 func (c *preflightCache) get(key preflightCacheKey) (RoundPreflightReport, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	for i := range c.entries {
 		if c.entries[i].key == key {
 			return cloneRoundPreflightReport(c.entries[i].report), true
@@ -51,6 +55,8 @@ func (c *preflightCache) get(key preflightCacheKey) (RoundPreflightReport, bool)
 
 func (c *preflightCache) put(key preflightCacheKey, report RoundPreflightReport) {
 	entry := preflightCacheEntry{key: key, report: cloneRoundPreflightReport(report)}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if len(c.entries) < cap(c.entries) {
 		c.entries = append(c.entries, entry)
 		return
