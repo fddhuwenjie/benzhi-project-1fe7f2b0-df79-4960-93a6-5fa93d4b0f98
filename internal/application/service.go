@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"paperqual/internal/domain"
@@ -15,18 +14,16 @@ import (
 type Clock func() time.Time
 
 type Service struct {
-	repo              *store.Repository
-	coord             *Coordinator
-	now               Clock
-	verificationMu    sync.RWMutex
-	verificationCache map[string]evidence.IntegrityReport
+	repo  *store.Repository
+	coord *Coordinator
+	now   Clock
 }
 
 func NewService(repo *store.Repository) *Service {
-	return &Service{repo: repo, coord: NewCoordinator(128), now: time.Now, verificationCache: make(map[string]evidence.IntegrityReport)}
+	return &Service{repo: repo, coord: NewCoordinator(128), now: time.Now}
 }
 func NewServiceWithClock(repo *store.Repository, clock Clock) *Service {
-	return &Service{repo: repo, coord: NewCoordinator(128), now: clock, verificationCache: make(map[string]evidence.IntegrityReport)}
+	return &Service{repo: repo, coord: NewCoordinator(128), now: clock}
 }
 
 func validateMeta(meta CommandMeta, create bool) error {
@@ -302,12 +299,6 @@ func (s *Service) Certificate(batchID string) (json.RawMessage, error) {
 	return s.repo.Certificate(batchID)
 }
 func (s *Service) VerifyCertificate(batchID string) (evidence.IntegrityReport, error) {
-	s.verificationMu.RLock()
-	cached, ok := s.verificationCache[batchID]
-	s.verificationMu.RUnlock()
-	if ok {
-		return cached, nil
-	}
 	snap, err := s.repo.Load(batchID)
 	if err != nil {
 		return evidence.IntegrityReport{}, err
@@ -337,9 +328,6 @@ func (s *Service) VerifyCertificate(batchID string) (evidence.IntegrityReport, e
 		report.Message = "证书审计锚点不在事件链中"
 		return report, domain.WithRevision(domain.Errorf(domain.CodeEvidenceCorrupt, report.Message), snap.Batch.Revision)
 	}
-	s.verificationMu.Lock()
-	s.verificationCache[batchID] = report
-	s.verificationMu.Unlock()
 	return report, nil
 }
 
