@@ -54,7 +54,7 @@ func Open(root string) (*Repository, error) {
 		}
 	}
 	for id := range batchIDs {
-		timeline, _, err := r.readTimeline(id, true)
+		timeline, _, err := r.readTimelineContext(context.Background(), id, true)
 		if err != nil {
 			return nil, fmt.Errorf("验证批次 %s 事件链: %w", id, err)
 		}
@@ -121,7 +121,7 @@ func (r *Repository) loadUnlockedContext(ctx context.Context, batchID string) (S
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, err
 	}
-	raw, err := os.ReadFile(r.snapshotPath(batchID))
+	raw, err := readFileContext(ctx, r.snapshotPath(batchID))
 	if errors.Is(err, fs.ErrNotExist) {
 		return Snapshot{}, domain.Errorf(domain.CodeNotFound, "批次 %s 不存在", batchID)
 	}
@@ -135,7 +135,7 @@ func (r *Repository) loadUnlockedContext(ctx context.Context, batchID string) (S
 	if snap.Idempotency == nil {
 		snap.Idempotency = map[string]IdempotencyEntry{}
 	}
-	entries, anchor, err := r.readTimeline(batchID, true)
+	entries, anchor, err := r.readTimelineContext(ctx, batchID, true)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -242,7 +242,7 @@ func (r *Repository) Timeline(batchID string) ([]TimelineEntry, string, error) {
 	lock := r.lockFor(batchID)
 	lock.RLock()
 	defer lock.RUnlock()
-	return r.readTimeline(batchID, false)
+	return r.readTimelineContext(context.Background(), batchID, false)
 }
 
 func (r *Repository) QueryTimeline(batchID string, query TimelineQuery) (TimelinePage, error) {
@@ -268,7 +268,7 @@ func (r *Repository) QueryTimeline(batchID string, query TimelineQuery) (Timelin
 	if query.SnapshotAnchor != "" && query.SnapshotAnchor != snap.EventAnchor {
 		return TimelinePage{}, domain.WithRevision(domain.Errorf(domain.CodeTimelineChanged, "时间线锚点已变化，请重新开始查询"), snap.Batch.Revision)
 	}
-	entries, anchor, err := r.readTimeline(batchID, false)
+	entries, anchor, err := r.readTimelineContext(context.Background(), batchID, false)
 	if err != nil {
 		return TimelinePage{}, err
 	}

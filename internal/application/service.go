@@ -119,6 +119,9 @@ func (s *Service) mutate(ctx context.Context, batchID, action string, meta Comma
 	if err != nil {
 		return Result{}, err
 	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
 	if entry, ok := snap.Idempotency[meta.RequestID]; ok {
 		if entry.Fingerprint != fp {
 			return Result{}, domain.WithRevision(domain.Errorf(domain.CodeIdempotency, "request_id 已被不同请求使用"), snap.Batch.Revision)

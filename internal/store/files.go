@@ -2,10 +2,13 @@ package store
 
 import (
 	"bufio"
+	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -79,12 +82,19 @@ func (r *Repository) appendFrame(batchID string, frame EventFrame) error {
 }
 
 func (r *Repository) readTimeline(batchID string, recoverTail bool) ([]TimelineEntry, string, error) {
-	path := r.eventPath(batchID)
-	f, err := os.OpenFile(path, os.O_RDONLY, 0o640)
-	if os.IsNotExist(err) {
-		return []TimelineEntry{}, "", nil
+	return r.readTimelineContext(context.Background(), batchID, recoverTail)
+}
+
+func (r *Repository) readTimelineContext(ctx context.Context, batchID string, recoverTail bool) ([]TimelineEntry, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
 	}
+	path := r.eventPath(batchID)
+	f, err := openFileContext(ctx, path, os.O_RDONLY, 0o640)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return []TimelineEntry{}, "", nil
+		}
 		return nil, "", err
 	}
 	defer f.Close()
@@ -93,16 +103,19 @@ func (r *Repository) readTimeline(batchID string, recoverTail bool) ([]TimelineE
 	anchor := ""
 	var offset int64
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
 		start := offset
-		header, err := readExact(reader, 8)
+		header, err := readExactContext(ctx, reader, 8)
 		if err == io.EOF {
 			return entries, anchor, nil
 		}
 		if err != nil {
-			if recoverTail {
-				return r.truncateTail(path, start, entries, anchor)
+			if recoverTail && !errors.Is(err, context.Canceled) {
+				return r.truncateTail(ctx, path, start, entries, anchor)
 			}
-			return nil, "", domain.Errorf(domain.CodeEvidenceCorrupt, "事件帧头截断")
+			return nil, "", mapReadError(err, "事件帧头截断")
 		}
 		offset += 8
 		if _, err := hex.DecodeString(string(header)); err != nil {
@@ -112,12 +125,12 @@ func (r *Repository) readTimeline(batchID string, recoverTail bool) ([]TimelineE
 		if err != nil || size64 == 0 || size64 > 16*1024*1024 {
 			return nil, "", domain.Errorf(domain.CodeEvidenceCorrupt, "事件帧长度无效")
 		}
-		body, err := readExact(reader, int(size64)+1)
+		body, err := readExactContext(ctx, reader, int(size64)+1)
 		if err != nil {
-			if recoverTail {
-				return r.truncateTail(path, start, entries, anchor)
+			if recoverTail && !errors.Is(err, context.Canceled) {
+				return r.truncateTail(ctx, path, start, entries, anchor)
 			}
-			return nil, "", domain.Errorf(domain.CodeEvidenceCorrupt, "事件尾帧截断")
+			return nil, "", mapReadError(err, "事件尾帧截断")
 		}
 		offset += int64(len(body))
 		if body[len(body)-1] != '\n' {
@@ -167,8 +180,36 @@ func readExact(r io.Reader, n int) ([]byte, error) {
 	return buf, nil
 }
 
-func (r *Repository) truncateTail(path string, size int64, entries []TimelineEntry, anchor string) ([]TimelineEntry, string, error) {
-	f, err := os.OpenFile(path, os.O_WRONLY, 0o640)
+func readExactContext(ctx context.Context, r io.Reader, n int) ([]byte, error) {
+	buf := make([]byte, n)
+	type result struct {
+		read int
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		read, err := io.ReadFull(r, buf)
+		ch <- result{read, err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		if res.err == io.EOF && res.read == 0 {
+			return nil, io.EOF
+		}
+		if res.err != nil {
+			return nil, res.err
+		}
+		return buf, nil
+	}
+}
+
+func (r *Repository) truncateTail(ctx context.Context, path string, size int64, entries []TimelineEntry, anchor string) ([]TimelineEntry, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	f, err := openFileContext(ctx, path, os.O_WRONLY, 0o640)
 	if err != nil {
 		return nil, "", err
 	}
@@ -183,17 +224,31 @@ func (r *Repository) truncateTail(path string, size int64, entries []TimelineEnt
 }
 
 func (r *Repository) truncateEventsAfter(batchID string, sequence uint64) error {
+	return r.truncateEventsAfterContext(context.Background(), batchID, sequence)
+}
+
+func (r *Repository) truncateEventsAfterContext(ctx context.Context, batchID string, sequence uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	path := r.eventPath(batchID)
-	f, err := os.Open(path)
+	f, err := openFileContext(ctx, path, os.O_RDONLY, 0o640)
 	if err != nil {
 		return err
 	}
 	reader := bufio.NewReader(f)
 	var offset int64
 	for current := uint64(0); current < sequence; current++ {
-		header, err := readExact(reader, 8)
+		if err := ctx.Err(); err != nil {
+			f.Close()
+			return err
+		}
+		header, err := readExactContext(ctx, reader, 8)
 		if err != nil {
 			f.Close()
+			if errors.Is(err, context.Canceled) {
+				return err
+			}
 			return domain.Errorf(domain.CodeEvidenceCorrupt, "恢复时事件帧头截断")
 		}
 		size, err := strconv.ParseUint(string(header), 16, 32)
@@ -201,8 +256,11 @@ func (r *Repository) truncateEventsAfter(batchID string, sequence uint64) error 
 			f.Close()
 			return domain.Errorf(domain.CodeEvidenceCorrupt, "恢复时事件帧长度无效")
 		}
-		if _, err := readExact(reader, int(size)+1); err != nil {
+		if _, err := readExactContext(ctx, reader, int(size)+1); err != nil {
 			f.Close()
+			if errors.Is(err, context.Canceled) {
+				return err
+			}
 			return domain.Errorf(domain.CodeEvidenceCorrupt, "恢复时事件帧截断")
 		}
 		offset += int64(8 + size + 1)
@@ -210,7 +268,7 @@ func (r *Repository) truncateEventsAfter(batchID string, sequence uint64) error 
 	if err := f.Close(); err != nil {
 		return err
 	}
-	writable, err := os.OpenFile(path, os.O_WRONLY, 0o640)
+	writable, err := openFileContext(ctx, path, os.O_WRONLY, 0o640)
 	if err != nil {
 		return err
 	}
@@ -228,4 +286,71 @@ func syncDir(path string) error {
 	}
 	defer d.Close()
 	return d.Sync()
+}
+
+// mapReadError preserves context cancellation as-is so callers can use
+// errors.Is(err, context.Canceled); other read failures are reported as
+// evidence corruption.
+func mapReadError(err error, message string) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return domain.Errorf(domain.CodeEvidenceCorrupt, message)
+}
+
+// openFileContext opens a file while respecting ctx cancellation. If ctx is
+// cancelled before os.OpenFile returns, any file handle that did get opened is
+// closed before returning, so no descriptor leaks.
+func openFileContext(ctx context.Context, path string, flag int, perm os.FileMode) (*os.File, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	type result struct {
+		f   *os.File
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		f, err := os.OpenFile(path, flag, perm)
+		ch <- result{f, err}
+	}()
+	select {
+	case <-ctx.Done():
+		go func() {
+			if res := <-ch; res.f != nil {
+				_ = res.f.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	case res := <-ch:
+		if res.err != nil {
+			return nil, res.err
+		}
+		return res.f, nil
+	}
+}
+
+// readFileContext reads the whole file while respecting ctx cancellation. If
+// cancelled, any goroutine still blocked in os.ReadFile returns once the file
+// descriptor is reclaimed by the runtime. The returned error is ctx.Err() so
+// callers can use errors.Is(err, context.Canceled).
+func readFileContext(ctx context.Context, path string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	type result struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		data, err := os.ReadFile(path)
+		ch <- result{data, err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		return res.data, res.err
+	}
 }
